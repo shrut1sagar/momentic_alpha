@@ -130,15 +130,30 @@ class QqqMomentumStrategy(Strategy):
         self.symbols = symbols
 
         # Store precomputed features
-        # Ensure features are indexed by timestamp for fast lookups
+        # Ensure features are indexed by NORMALIZED (timezone-naive, date-only) timestamps
+        # This must match the format the backtest engine uses when calling generate_target_weights
         if "timestamp" in qqq_features.columns and not isinstance(qqq_features.index, pd.DatetimeIndex):
             # Set timestamp as index for fast date lookups
-            self.qqq_features = qqq_features.set_index("timestamp")
-        else:
-            self.qqq_features = qqq_features
+            qqq_features = qqq_features.set_index("timestamp")
+
+        # Normalize index to timezone-naive dates (drop time component and timezone)
+        # The backtest engine normalizes dates via dt.normalize() which creates timezone-naive dates
+        # We must match that format for lookups to work
+        if isinstance(qqq_features.index, pd.DatetimeIndex):
+            # Handle timezone conversion: if tz-aware, convert to UTC then remove tz; if naive, keep as-is
+            if qqq_features.index.tz is not None:
+                # Timezone-aware: convert to UTC, then strip timezone, then normalize to midnight
+                normalized_index = qqq_features.index.tz_convert('UTC').tz_localize(None).normalize()
+            else:
+                # Timezone-naive: just normalize to midnight
+                normalized_index = qqq_features.index.normalize()
+            qqq_features.index = normalized_index
+
+        self.qqq_features = qqq_features
 
         # Precompute regimes for all dates
         # This saves computation during backtesting (classify once, use many times)
+        # Regimes will have the same normalized index as qqq_features
         self.regimes = classify_momentum_regime(self.qqq_features, regime_params)
 
         # Validate that features have required columns
@@ -202,18 +217,27 @@ class QqqMomentumStrategy(Strategy):
         Raises:
             None (returns safe default on errors).
         """
-        # Normalize dt to date (drop time component if present) for consistent lookups
-        # The engine passes timestamps with time components, but our features are indexed by date
-        dt_date = pd.Timestamp(dt.date())
+        # Normalize dt to match the format of our feature/regime index
+        # The backtest engine passes normalized timestamps (timezone-naive, time=00:00:00)
+        # Our features are indexed by the same format (set up in __init__)
+        # However, we still normalize here for defensive consistency
+        dt_ts = pd.Timestamp(dt)
+        if dt_ts.tz is not None:
+            # Timezone-aware: convert to UTC, strip timezone, normalize
+            dt_normalized = dt_ts.tz_convert('UTC').tz_localize(None).normalize()
+        else:
+            # Timezone-naive: just normalize
+            dt_normalized = dt_ts.normalize()
 
         # Look up regime for current date
         # If dt is not in regimes (warm-up period or missing data), fall back to NEUTRAL
-        if dt_date not in self.regimes.index:
+        if dt_normalized not in self.regimes.index:
             # Warm-up period: not enough data to compute features
             # Safe default: return empty dict = all cash
+            # Note: This should be rare after warm-up; if it's common, check timestamp alignment
             return {}
 
-        regime = self.regimes.loc[dt_date]
+        regime = self.regimes.loc[dt_normalized]
 
         # Handle NaN regime (shouldn't happen, but defensive programming)
         if pd.isna(regime):
@@ -237,16 +261,25 @@ class QqqMomentumStrategy(Strategy):
         during backtests or for generating "reasoning traces" (which regime was active
         on each date).
 
+        **Timestamp handling**: Normalizes the input timestamp to match the regime index format
+        (timezone-naive, date-only). This ensures consistent lookups regardless of input format.
+
         Args:
-            dt: Date to look up.
+            dt: Date to look up (can be timezone-aware or have time component).
 
         Returns:
             MomentumRegime enum value, or None if date not found.
         """
-        dt_date = pd.Timestamp(dt.date())
-        if dt_date not in self.regimes.index:
+        # Normalize to match regime index format
+        dt_ts = pd.Timestamp(dt)
+        if dt_ts.tz is not None:
+            dt_normalized = dt_ts.tz_convert('UTC').tz_localize(None).normalize()
+        else:
+            dt_normalized = dt_ts.normalize()
+
+        if dt_normalized not in self.regimes.index:
             return None
-        regime = self.regimes.loc[dt_date]
+        regime = self.regimes.loc[dt_normalized]
         return regime if not pd.isna(regime) else None
 
     def get_feature_snapshot(self, dt: pd.Timestamp) -> pd.Series | None:
@@ -259,14 +292,22 @@ class QqqMomentumStrategy(Strategy):
           - Reporting: "QQQ velocity was +0.02 and acceleration was -0.01 on this date."
           - Visualization: Plot features alongside equity curve to understand performance.
 
+        **Timestamp handling**: Normalizes the input timestamp to match the feature index format.
+
         Args:
-            dt: Date to look up.
+            dt: Date to look up (can be timezone-aware or have time component).
 
         Returns:
             pd.Series with feature values (closing_price, MAs, spreads, velocity, accel),
             or None if date not found.
         """
-        dt_date = pd.Timestamp(dt.date())
-        if dt_date not in self.qqq_features.index:
+        # Normalize to match feature index format
+        dt_ts = pd.Timestamp(dt)
+        if dt_ts.tz is not None:
+            dt_normalized = dt_ts.tz_convert('UTC').tz_localize(None).normalize()
+        else:
+            dt_normalized = dt_ts.normalize()
+
+        if dt_normalized not in self.qqq_features.index:
             return None
-        return self.qqq_features.loc[dt_date]
+        return self.qqq_features.loc[dt_normalized]

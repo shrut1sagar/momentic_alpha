@@ -100,7 +100,7 @@ def compute_moving_average_simple(prices: pd.Series, window: int) -> pd.Series:
 
     **Mathematical**: At each time t, the SMA is:
         SMA_t = (1 / window) * Σ(P_{t-i}) for i = 0 to window-1
-    This is the arithmetic mean of the last `window` prices.
+    This is the arithmetic mean of the last `window` prices BEFORE time t (inclusive).
 
     **Functionally**:
     - Input: pandas Series of prices or any feature series; window size (integer).
@@ -109,6 +109,9 @@ def compute_moving_average_simple(prices: pd.Series, window: int) -> pd.Series:
     - Used for trend context (e.g., 50-day, 100-day, 250-day levels) before
       strategy logic is developed.
     - Daily frequency assumed (window is in days).
+    - **IMPORTANT**: Works correctly for both ascending (oldest first) and
+      descending (newest first) data order. For descending data (Phase 3 schema),
+      the function reverses the data before computing the MA to avoid look-ahead bias.
 
     **Edge cases**:
     - Window must be >= 1; window = 1 returns the original series.
@@ -121,7 +124,24 @@ def compute_moving_average_simple(prices: pd.Series, window: int) -> pd.Series:
     Returns:
         Time series of simple moving average, same index as input.
     """
-    # Use pandas rolling window with arithmetic mean
+    # CRITICAL FIX: Check if data is in descending order (newest first)
+    # pandas rolling() always looks backward in positional terms, but for
+    # descending data this means looking forward in TIME, causing look-ahead bias.
+    #
+    # Solution: Reverse to ascending order, compute MA, then reverse back.
+
+    if len(prices) > 1:
+        # Check if indices are descending (indicator of newest-first order)
+        indices = prices.index.tolist()
+        if indices[-1] < indices[0]:
+            # Data is in descending order - reverse it
+            prices_ascending = prices.iloc[::-1]
+            # Compute MA on ascending data (no look-ahead bias)
+            ma_ascending = prices_ascending.rolling(window=window).mean()
+            # Reverse back to descending order
+            return ma_ascending.iloc[::-1]
+
+    # Data is in ascending order or single-element - compute normally
     # min_periods defaults to window, so we get NaN until window is filled
     return prices.rolling(window=window).mean()
 
@@ -149,6 +169,8 @@ def compute_moving_average_exponential(prices: pd.Series, span: int) -> pd.Serie
     - Helpful for responsive signals and later regime detection without introducing
       excessive lag typical of long simple moving averages.
     - Daily frequency assumed.
+    - **IMPORTANT**: Works correctly for both ascending and descending data order.
+      For descending data (Phase 3 schema), reverses before computing to avoid look-ahead bias.
 
     **Edge cases**:
     - Span must be >= 1; span = 1 approaches P_t (minimal smoothing).
@@ -161,7 +183,18 @@ def compute_moving_average_exponential(prices: pd.Series, span: int) -> pd.Serie
     Returns:
         Time series of exponential moving average, same index as input.
     """
-    # Use pandas exponential weighted moving average
+    # CRITICAL FIX: Same as SMA - check for descending order
+    if len(prices) > 1:
+        indices = prices.index.tolist()
+        if indices[-1] < indices[0]:
+            # Data is in descending order - reverse it
+            prices_ascending = prices.iloc[::-1]
+            # Compute EMA on ascending data
+            ema_ascending = prices_ascending.ewm(span=span, adjust=False).mean()
+            # Reverse back to descending order
+            return ema_ascending.iloc[::-1]
+
+    # Data is in ascending order or single-element - compute normally
     # adjust=False gives the recursive form commonly used in trading
     return prices.ewm(span=span, adjust=False).mean()
 
@@ -190,6 +223,7 @@ def compute_rolling_standard_deviation(returns: pd.Series, window: int) -> pd.Se
       and is used in position scaling and risk budgeting.
     - Assumes cleaned return data (no large gaps or missing values).
     - Units are in the same frequency as input (e.g., daily std for daily returns).
+    - **IMPORTANT**: Works correctly for both ascending and descending data order.
 
     **Edge cases**:
     - Window must be >= 2 for std to be defined (ddof=1).
@@ -202,6 +236,18 @@ def compute_rolling_standard_deviation(returns: pd.Series, window: int) -> pd.Se
     Returns:
         Time series of rolling standard deviation, same index as input.
     """
+    # CRITICAL FIX: Same pattern as SMA/EMA - check for descending order
+    if len(returns) > 1:
+        indices = returns.index.tolist()
+        if indices[-1] < indices[0]:
+            # Data is in descending order - reverse it
+            returns_ascending = returns.iloc[::-1]
+            # Compute rolling std on ascending data
+            std_ascending = returns_ascending.rolling(window=window).std(ddof=1)
+            # Reverse back to descending order
+            return std_ascending.iloc[::-1]
+
+    # Data is in ascending order or single-element - compute normally
     # Use pandas rolling with std; ddof=1 for sample std (unbiased estimator)
     return returns.rolling(window=window).std(ddof=1)
 
@@ -280,6 +326,9 @@ def compute_velocity(
     - Daily frequency assumed; slope units are price change per day (or log-price per day).
     - Later used in QQQ/TQQQ/SQQQ allocation logic to gauge trend strength.
     - use_log=True is recommended for symmetry and stability (log returns are additive).
+    - **IMPORTANT**: Works correctly regardless of whether data is sorted in ascending
+      (oldest first) or descending (newest first) order. The function handles both by
+      reversing the window to chronological order before regression.
 
     **Edge cases**:
     - Flat prices yield velocity ≈ 0.
@@ -307,12 +356,40 @@ def compute_velocity(
     for i in range(window - 1, len(prices)):
         # Extract the window of (log) prices
         window_y = y.iloc[i - window + 1 : i + 1]
+
+        # CRITICAL FIX: Ensure window is in chronological order (oldest to newest)
+        # for correct slope calculation.
+        #
+        # The Phase 3 schema specifies data is in descending order (newest first),
+        # so iloc[i-window+1:i+1] gives [newest, ..., oldest].
+        # Regression needs [oldest, ..., newest] to get correct positive slope
+        # for rising prices.
+        #
+        # However, test data may be in ascending order. We need to detect which
+        # order the window is in and ensure chronological order.
+        #
+        # Detection: Check if the index values are increasing or decreasing.
+        # If index is not monotonic, we fall back to assuming descending (Phase 3 default).
+        window_indices = window_y.index.tolist()
+
+        # Check if indices are in ascending order (chronological for timestamp indices)
+        # For integer indices, we can't tell chronological order, so we check if
+        # they're decreasing (which would indicate newest-first for descending data)
+        if len(window_indices) > 1 and window_indices[-1] < window_indices[0]:
+            # Indices are descending, which for timestamp indices means newest first
+            # Reverse to get chronological order
+            window_y_values = window_y.values[::-1]
+        else:
+            # Indices are ascending or equal - assume already chronological
+            window_y_values = window_y.values
+
         # Time index for regression (0, 1, 2, ..., window-1)
+        # Now x=0 corresponds to oldest price, x=window-1 to newest
         window_x = np.arange(window)
 
         # Fit linear regression: y = slope * x + intercept
         # linregress returns (slope, intercept, r_value, p_value, std_err)
-        slope, _, _, _, _ = stats.linregress(window_x, window_y)
+        slope, _, _, _, _ = stats.linregress(window_x, window_y_values)
 
         # Store the slope as velocity at this timestep
         velocity.iloc[i] = slope

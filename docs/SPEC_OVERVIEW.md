@@ -422,6 +422,11 @@ Adherence to CSV contracts.
 Basic backtest sanity (e.g. always-cash strategy behaves as expected).
 
 5. Canonical CSV Schemas
+5.0 Timestamps
+- Column name: `timestamp`.
+- Format on disk: `"YYYY-MM-DD HH:MM:SS"` (UTC, human-readable). Legacy ISO strings with `T` are tolerated on read.
+- Rows stored strictly in descending order by `timestamp` (newest first).
+
 5.1 General Rules
 
 Date column:

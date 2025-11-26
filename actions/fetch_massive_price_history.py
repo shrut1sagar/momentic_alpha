@@ -18,7 +18,7 @@ saves them to CSV files in the project's data/raw/ directory.
   4. For each symbol:
      a. Fetch daily bars from Massive API
      b. Validate data (check for gaps, anomalies)
-     c. Save to data/raw/{symbol}_daily.csv
+     c. Save to data/raw/{symbol}.csv
   5. Print summary (rows fetched, date range, file location)
 
 **Why this script is needed**:
@@ -42,7 +42,7 @@ the full data ingestion workflow.
     Fetching QQQ daily bars from 2024-01-01 to 2024-12-31...
     ✓ Fetched 252 bars for QQQ
     ✓ Date range: 2024-01-01 to 2024-12-31
-    ✓ Saved to data/raw/QQQ_daily.csv
+    ✓ Saved to data/raw/QQQ.csv
     Done!
 """
 
@@ -116,8 +116,8 @@ Examples:
     parser.add_argument(
         "--start",
         type=str,
-        help="Start date in YYYY-MM-DD format (default: 2020-01-01)",
-        default="2020-01-01",
+        help="Start date in YYYY-MM-DD format (default: 1970-01-01)",
+        default="1970-01-01",
     )
 
     parser.add_argument(
@@ -334,7 +334,7 @@ def fetch_and_save_symbol(
     print(f"Fetching {symbol} daily bars from {start.date()} to {end.date()} (mode: {mode_str})...")
 
     # Construct output file path
-    output_file = output_dir / f"{symbol}_daily.csv"
+    output_file = output_dir / f"{symbol}.csv"
 
     # Check if file already exists
     file_exists = output_file.exists()

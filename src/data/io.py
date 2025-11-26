@@ -31,6 +31,207 @@ from src.data.schemas import (
 )
 
 
+def normalize_timestamp_column(
+    df: pd.DataFrame,
+    col: str = "timestamp",
+    ensure_date_column: bool = False,
+) -> pd.DataFrame:
+    """
+    Normalize a timestamp column to the project's canonical format.
+
+    **Canonical format**:
+    - Column name: "timestamp"
+    - String format on disk: "YYYY-MM-DD HH:MM:SS" (space, not 'T')
+    - Timezone: Treated as UTC (no explicit timezone stored)
+    - Sort order: Strictly descending by timestamp (newest first)
+
+    **Robustness**:
+    - Handles timestamps that are already datetime64 dtype (no re-parsing needed)
+    - Handles timestamps that are strings in either legacy or new format
+    - Returns empty DataFrames unchanged (no crash on empty data)
+    - Preserves all other columns unchanged
+
+    **Functionally**:
+    - Parses the timestamp column using pd.to_datetime if not already datetime
+      (handles both "YYYY-MM-DDTHH:MM:SS" and "YYYY-MM-DD HH:MM:SS" formats)
+    - Sorts rows in strictly descending order by timestamp (newest first)
+    - Optionally adds a human-readable "date" column (YYYY-MM-DD) for inspection
+    - Leaves timestamp as datetime64 dtype for in-memory use
+
+    **Why this function exists**:
+    - Centralizes timestamp normalization logic for consistency
+    - Makes it easy to standardize CSVs written by actions/scripts
+    - Ensures all CSV outputs follow the same canonical format
+    - Provides a single place to update if format changes
+
+    **Teaching note**: Timestamp handling is a common source of bugs in quant systems.
+    By centralizing normalization, we ensure that all CSVs (raw data, features,
+    backtest results) follow the same conventions. This makes data inspection,
+    debugging, and validation much easier.
+
+    Args:
+        df: DataFrame containing a timestamp column.
+        col: Name of the timestamp column (default: "timestamp").
+        ensure_date_column: If True, adds a "date" column (YYYY-MM-DD) for
+                           human-readable inspection. Defaults to False.
+
+    Returns:
+        DataFrame with normalized timestamp column, sorted descending by timestamp.
+        The timestamp column remains as datetime64 dtype (not converted to string).
+
+    Raises:
+        KeyError: If the specified timestamp column doesn't exist.
+        ValueError: If the timestamp column can't be parsed as datetime.
+
+    Example:
+        >>> # Works with string timestamps
+        >>> df = pd.DataFrame({
+        ...     'timestamp': ['2024-01-15T00:00:00', '2024-01-14 12:00:00'],
+        ...     'value': [100, 200]
+        ... })
+        >>> normalized = normalize_timestamp_column(df)
+        >>> normalized['timestamp'].dtype
+        dtype('<M8[ns]')
+        >>> normalized['timestamp'].iloc[0] > normalized['timestamp'].iloc[1]
+        True  # Descending order confirmed
+
+        >>> # Works with already-parsed datetimes
+        >>> df2 = pd.DataFrame({
+        ...     'timestamp': pd.to_datetime(['2024-01-15', '2024-01-14']),
+        ...     'value': [100, 200]
+        ... })
+        >>> normalized2 = normalize_timestamp_column(df2)
+        >>> normalized2['timestamp'].dtype
+        dtype('<M8[ns]')
+    """
+    # Handle empty DataFrame gracefully - return unchanged
+    if df.empty:
+        return df.copy()
+
+    # Make a copy to avoid modifying the input
+    df_normalized = df.copy()
+
+    # Check if column exists
+    if col not in df_normalized.columns:
+        raise KeyError(
+            f"Timestamp column '{col}' not found in DataFrame. "
+            f"Available columns: {list(df_normalized.columns)}"
+        )
+
+    # Parse timestamp column to datetime if it's not already datetime type
+    # This handles both string timestamps and already-parsed datetime objects
+    if not pd.api.types.is_datetime64_any_dtype(df_normalized[col]):
+        # Column is not datetime - parse it
+        try:
+            # pd.to_datetime with format='ISO8601' handles:
+            # - "YYYY-MM-DDTHH:MM:SS" (legacy format with 'T')
+            # - "YYYY-MM-DD HH:MM:SS" (new canonical format with space)
+            # - Mixed formats in the same column
+            df_normalized[col] = pd.to_datetime(df_normalized[col], format='ISO8601')
+        except Exception as e:
+            raise ValueError(
+                f"Failed to parse '{col}' column as datetime. "
+                f"Expected ISO 8601 format (e.g., '2024-01-15 00:00:00' or '2024-01-15T00:00:00'). "
+                f"Error: {e}"
+            )
+    # else: Column is already datetime64 dtype - no parsing needed
+
+    # Sort by timestamp in strictly descending order (newest first)
+    # This is the canonical sort order for all time-series data in this project
+    df_normalized = df_normalized.sort_values(col, ascending=False).reset_index(drop=True)
+
+    # Optionally add a "date" column for human inspection
+    # This provides a human-readable date without the time component
+    if ensure_date_column and 'date' not in df_normalized.columns:
+        df_normalized['date'] = df_normalized[col].dt.strftime('%Y-%m-%d')
+
+    return df_normalized
+
+
+def write_normalized_csv(
+    df: pd.DataFrame,
+    path: Path | str,
+    timestamp_col: str = "timestamp",
+    ensure_date_column: bool = False,
+) -> None:
+    """
+    Write a DataFrame to CSV with normalized timestamps and canonical format.
+
+    **Canonical format on disk**:
+    - Timestamps written as "YYYY-MM-DD HH:MM:SS" (space, not 'T')
+    - Rows sorted strictly descending by timestamp (newest first)
+    - Optional "date" column for human inspection
+    - All other columns preserved unchanged
+
+    **Robustness**:
+    - Handles DataFrames where timestamp is already datetime64 or still string
+    - Handles empty DataFrames (writes empty CSV with headers)
+    - Preserves all columns except timestamp (which gets normalized)
+    - Creates parent directory if it doesn't exist
+
+    **Functionally**:
+    - Calls normalize_timestamp_column() to parse and sort timestamps
+    - Converts timestamp datetime to canonical string format for CSV storage
+    - Writes CSV with index=False (no row numbers)
+
+    **Teaching note**: This is a convenience wrapper for writing CSVs from
+    actions/scripts. It handles all the normalization boilerplate so scripts
+    don't have to repeat the same logic. Use this for backtest results,
+    analysis outputs, and any CSV that contains a time series.
+
+    Args:
+        df: DataFrame to write (must contain timestamp column).
+        path: Path where CSV should be written.
+        timestamp_col: Name of timestamp column (default: "timestamp").
+        ensure_date_column: If True, adds "date" column (YYYY-MM-DD) for
+                           human inspection (default: False).
+
+    Raises:
+        KeyError: If timestamp column doesn't exist.
+        ValueError: If timestamp column can't be parsed as datetime.
+        OSError: If file can't be written (permissions, disk full, etc.).
+
+    Example:
+        >>> # Works with datetime timestamps
+        >>> df = pd.DataFrame({
+        ...     'timestamp': pd.to_datetime(['2024-01-15', '2024-01-14']),
+        ...     'value': [100, 200]
+        ... })
+        >>> write_normalized_csv(df, "output.csv")
+        # output.csv will have timestamps as "2024-01-15 00:00:00", sorted descending
+
+        >>> # Also works with string timestamps
+        >>> df2 = pd.DataFrame({
+        ...     'timestamp': ['2024-01-15T00:00:00', '2024-01-14 12:00:00'],
+        ...     'value': [100, 200]
+        ... })
+        >>> write_normalized_csv(df2, "output.csv")
+        # Same result - both formats are normalized to "YYYY-MM-DD HH:MM:SS"
+    """
+    # Convert path to Path object for consistent handling
+    path = Path(path)
+
+    # Ensure parent directory exists (create if necessary)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Normalize timestamp column (parse if string, sort descending, add date column if requested)
+    df_to_write = normalize_timestamp_column(df, col=timestamp_col, ensure_date_column=ensure_date_column)
+
+    # Convert timestamp from datetime64 to canonical string format: "YYYY-MM-DD HH:MM:SS"
+    # This is the on-disk representation that readers will parse back to datetime
+    # Skip formatting if DataFrame is empty (no .dt accessor on empty Series)
+    if not df_to_write.empty:
+        df_to_write[timestamp_col] = df_to_write[timestamp_col].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+    # Write to CSV with index=False (no row numbers column)
+    try:
+        df_to_write.to_csv(path, index=False)
+    except Exception as e:
+        raise OSError(
+            f"Failed to write CSV to {path}. Error: {e}"
+        )
+
+
 def read_raw_price_csv(
     path: Path | str,
     instrument_name: str | None = None,
@@ -47,6 +248,11 @@ def read_raw_price_csv(
       - Parses `timestamp` column to datetime objects.
       - Validates schema (required columns, timestamp format, descending order).
       - Returns a DataFrame ready for feature engineering or direct use.
+
+    **Timestamp format handling**:
+      - Accepts both legacy "YYYY-MM-DDTHH:MM:SS" and new "YYYY-MM-DD HH:MM:SS" formats
+      - Always returns timestamp as datetime64 dtype (not string)
+      - pd.to_datetime handles both formats automatically via format='ISO8601'
 
     **Why parse timestamps on read?**
       - Datetime objects are easier to work with than strings (filtering, sorting,
@@ -113,13 +319,16 @@ def read_raw_price_csv(
 
     # Parse timestamp column to datetime
     # This must happen before validation so validate_raw_price_schema can check datetime dtype
+    # Accepts both legacy "YYYY-MM-DDTHH:MM:SS" and new "YYYY-MM-DD HH:MM:SS" formats
     if 'timestamp' in df.columns:
         try:
+            # pd.to_datetime with format='ISO8601' handles both formats automatically
             df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601')
         except Exception as e:
             raise SchemaValidationError(
                 f"{context}: Failed to parse 'timestamp' column as datetime. "
-                f"Expected ISO 8601 format (e.g., '2024-01-15T00:00:00'). Error: {e}"
+                f"Expected ISO 8601 format (e.g., '2024-01-15 00:00:00' or '2024-01-15T00:00:00'). "
+                f"Error: {e}"
             )
     else:
         # Validation will catch this, but we raise here for clarity
@@ -208,8 +417,8 @@ def write_raw_price_csv(
     # Validate schema before writing (fail fast if invalid)
     validate_raw_price_schema(df_to_write, context=context)
 
-    # Convert timestamp to ISO 8601 strings for CSV storage
-    df_to_write['timestamp'] = df_to_write['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%S')
+    # Convert timestamp to canonical format: "YYYY-MM-DD HH:MM:SS" (space, not 'T')
+    df_to_write['timestamp'] = df_to_write['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
 
     # Write to CSV with stable column order
     # index=False: don't write row numbers
@@ -387,8 +596,8 @@ def write_processed_data_csv(
     # Validate schema before writing
     validate_processed_schema(df_to_write, required_features=None, context=context)
 
-    # Convert timestamp to ISO 8601 strings
-    df_to_write['timestamp'] = df_to_write['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%S')
+    # Convert timestamp to canonical format: "YYYY-MM-DD HH:M:SS" (space, not 'T')
+    df_to_write['timestamp'] = df_to_write['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
 
     # Write to CSV
     # Note: We write all columns (not just a subset) because processed data

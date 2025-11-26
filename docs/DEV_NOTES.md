@@ -334,6 +334,10 @@ Note: These generators let us validate backtesting plumbing and risk metrics und
 - All CSV access points should use these functions instead of ad-hoc `pd.read_csv`.
 - Consider a custom `SchemaValidationError` (either in `schemas.py` or shared `src/utils/errors.py`) for clarity.
 - On-disk contract: all CSVs (raw, processed, results) are stored strictly descending by `timestamp` for human inspection; writers must enforce this even if internal DataFrames are ascending. Readers may return ascending DataFrames for analytics/backtesting, but the persisted representation is always newest-first.
+- Timestamp format update:
+  - Legacy reads: tolerate both `"YYYY-MM-DDTHH:MM:SS"` and `"YYYY-MM-DD HH:MM:SS"` via `pd.to_datetime`.
+  - New writes: must format `timestamp` as `"YYYY-MM-DD HH:MM:SS"` (UTC), sorted descending, `index=False`.
+  - Optional human helper: a `date` column (`"YYYY-MM-DD"`) may be included for inspection; engine ignores it.
 
 ### src/data/loaders.py – instrument-specific convenience loaders
 
@@ -712,7 +716,7 @@ Note: These generators let us validate backtesting plumbing and risk metrics und
 - Test files:
   - `tests/test_venues_massive_client.py`
   - `tests/test_venues_massive_data_provider.py`
-  - Optional: `tests/test_actions_fetch_massive_price_history.py`
+- Optional: `tests/test_actions_fetch_massive_price_history.py`
 - Key decisions: Massive is accessed only via `MassiveClient` + `MassiveDataProvider`; canonical schema + IO layer reused (no direct `to_csv`); HTTP is mocked in tests (no live Massive dependency).
 
 ### Incremental fetch and ordering rules
@@ -721,6 +725,79 @@ Note: These generators let us validate backtesting plumbing and risk metrics und
 - Default fetch: incremental—only fills missing timestamps in the requested window without altering existing rows.
 - Force fetch: replaces rows in the requested window but preserves rows outside it.
 - All merging logic is timestamp-based and must deduplicate before writing.
+- Results/analytics (equity curves, reasoning traces, metrics exports) must also persist `timestamp` as `"YYYY-MM-DD HH:MM:SS"` (UTC), newest-first on disk. Readers tolerate legacy `T` strings via `pd.to_datetime`.
+
+### Timestamp normalization implementation detail (Phase 3 IO)
+
+- Readers (`read_raw_price_csv`, `read_processed_data_csv`, result readers):
+  - Always call `pd.to_datetime` on `timestamp` and tolerate both `"YYYY-MM-DDTHH:MM:SS"` and `"YYYY-MM-DD HH:MM:SS"`.
+  - Return DataFrames with datetime `timestamp`; internal ordering can be ascending if useful.
+- Writers (`write_raw_price_csv`, `write_processed_data_csv`, result/equity/trace writers):
+  - Ensure `timestamp` exists and is datetime.
+  - Sort strictly descending by `timestamp`.
+  - Format `timestamp` to `"YYYY-MM-DD HH:MM:SS"` (UTC) before writing with `index=False`.
+  - Optional helper `date` column (`"YYYY-MM-DD"`) may be added for humans; engine ignores it.
+- Helper (design):
+  ```python
+  def normalise_timestamp_column(df: pd.DataFrame, col: str = "timestamp") -> pd.DataFrame:
+      """
+      Converts df[col] to datetime (tolerating 'T' or space separators), sorts by timestamp descending,
+      and prepares for write by formatting to 'YYYY-MM-DD HH:MM:SS'.
+      """
+  ```
+  This should be used by all CSV-writing paths to guarantee consistency.
+
+### Migration notes
+
+- Existing CSVs with `timestamp` formatted as `"YYYY-MM-DDTHH:MM:SS"` will continue to load correctly because readers use `pd.to_datetime`.
+- As files are rewritten (e.g., via fetch actions or a dedicated normalization action), they should be emitted in the new `"YYYY-MM-DD HH:MM:SS"` format with descending order.
+- Optional future action (`actions/normalise_all_timestamps.py`): walk known CSV roots (`data/raw`, `data/processed`, `data/results`), load, normalize timestamps, and rewrite using the canonical format.
+
+### Finnhub configuration and usage notes
+
+- Secrets: configure `FINNHUB_API_KEY` via `.env` (see `.env.example`). Never hardcode or commit real keys.
+- Settings object: `FinnhubSettings` is the single source for API key, base URL, min sleep, timeout; providers/clients must be constructed from this (no ad-hoc `os.getenv` lookups).
+- Failure modes: if `FINNHUB_API_KEY` is missing/empty, settings construction should raise `ValueError` (fail fast).
+- Rate limits: free tier ~60 calls/min; default `min_sleep_seconds=0.2` provides polite pacing. Adjust via env if needed.
+- Webhooks/“X-Finnhub-Secret”: the provided secret header applies to webhooks only and is not used in pull-based fetches; document but do not embed secrets.
+
+#### Finnhub configuration (how to set keys)
+- Expect `FINNHUB_API_KEY` in the environment (or loaded from `.env`).
+- Example `.env` snippet (placeholder only):
+  ```env
+  FINNHUB_API_KEY=your_finnhub_api_key_here
+  # DATA_SOURCE_NAME=finnhub
+  ```
+- To set in WSL shell:
+  ```bash
+  export FINNHUB_API_KEY="your_real_key_here"
+  ```
+  Or copy `.env.example` to `.env` and fill in your real key. Never commit real keys.
+- Warnings: never paste real keys into code or chat; rotate if exposed.
+
+#### Finnhub rate limits & caveats
+- Designed for free-tier research use; be polite with requests.
+- Default `min_sleep_seconds=0.2` (~5 req/s) to stay under common free limits (~60/min); tune via env if your tier differs.
+- Webhook secret (`X-Finnhub-Secret`) is for incoming webhooks, not used by pull-based fetches. Do not hardcode it; store securely if needed for webhook endpoints.
+- Free plan may return `"You don't have access to this resource."` for `/stock/candle` on many tickers; code raises `FinnhubAccessError` and the fetch script logs/skips those tickers. Paid plan or alternate provider needed for full coverage.
+
+  - `actions/fetch_price_history_alphavantage.py` enforces 12-second delay between requests (5 calls/min)
+  - Prints warning about daily/minute limits before starting
+  - Shows API call count before fetching
+  - Rate limit errors are caught and reported clearly
+- **Data coverage**:
+  - Good coverage for US stocks, ETFs, forex, crypto
+  - Historical data typically from 1999 onwards for major symbols
+  - Returns full history by default (outputsize=full)
+  - Date filtering happens client-side (API returns all data)
+
+#### Alpha Vantage API response format
+- Returns nested JSON with "Time Series (Daily)" dictionary
+- Each date is a key (e.g., "2025-11-26") with OHLCV sub-dictionary
+- Columns are numbered strings: "1. open", "2. high", "3. low", "4. close", "5. volume"
+- Provider converts to canonical schema: timestamp, open_price, high_price, low_price, closing_price, volume
+- Errors appear in "Error Message" field
+- Rate limit warnings appear in "Note" field
 
 ### Phase 6 Implementation summary
 
@@ -1748,3 +1825,24 @@ Phase 3 provides robust data I/O and schema enforcement. With this foundation, P
 - Strategy implementations (e.g., Strategy 1: QQQ long/short) that consume feature data and generate signals
 - Orchestration workflows that chain data ingestion → feature engineering → backtesting → results export
 - All of the above can trust that data conforms to schemas and that I/O is centralized and validated
+
+## Alpha Vantage data provider
+
+- Purpose: Daily OHLCV via Alpha Vantage (`TIME_SERIES_DAILY`), producing the canonical schema (`timestamp`, open/high/low/close/volume) and normalized on write via existing IO helpers.
+- Configuration: set `ALPHAVANTAGE_API_KEY` in `.env` (see `.env.example`). Settings include base URL (`https://www.alphavantage.co/query`), function (`TIME_SERIES_DAILY`), outputsize (`full`), and optional min sleep/timeout to respect limits.
+- CLI/action (`actions/fetch_price_history_alphavantage.py`):
+  - Args: `--start` (default `1950-01-01`), `--end` (default today), `--tickers` (comma-separated; default universe: QQQ, SQQQ, TQQQ, SPY, VIX, UVXY, VIXM, VIXY, VIXX, GLD, OIL, TLT), `--force` (overwrite window).
+  - Incremental (no `--force`): add missing timestamps; leave overlapping rows unchanged. Force: overwrite rows in [start, end], keep outside rows.
+  - Example: `python actions/fetch_price_history_alphavantage.py --tickers QQQ,SPY --start 2010-01-01 --end 2020-12-31`
+- Rate limits: free tier is very strict (~25 calls/day, 5/min). Avoid large universes; expect `AlphaVantageRateLimitError` if exceeded—script may stop/skip to conserve quota. Consider spacing calls or running limited tickers per day. Use local cached CSVs to minimize API usage.
+
+## YFinance data provider
+
+- Purpose: Daily OHLCV via Yahoo Finance using the `yfinance` library (keyless, public endpoints). Produces canonical columns (`timestamp`, open/high/low/close/volume); timestamps normalized on write by IO helpers.
+- Settings: `YFinanceSettings` (interval `1d` by default; flags like `auto_adjust`, `back_adjust`, `prepost`; optional threads/proxy/timeout). No API key required.
+- Action script: `actions/fetch_price_history_yfinance.py` mirrors other fetchers:
+  - Args: `--start` (default early date), `--end` (default today), `--tickers` (comma-separated; default universe: QQQ, SQQQ, TQQQ, SPY, VIX, UVXY, VIXM, VIXY, VIXX, GLD, OIL, TLT), `--force` (overwrite window).
+  - Incremental (no `--force`): add missing timestamps; leave overlapping rows unchanged. Force: overwrite rows in [start, end], keep outside rows.
+  - Example: `python actions/fetch_price_history_yfinance.py --tickers QQQ,SPY --start 2020-01-01 --end 2021-12-31`
+- Error/empty handling: If yfinance returns no data in window, log once and skip writing. Network/API errors should be surfaced via provider exceptions similar to other providers.
+- When to use: Convenient, keyless, good for equities/ETFs; Massive remains primary controlled source; Alpha Vantage is constrained by free-tier limits.

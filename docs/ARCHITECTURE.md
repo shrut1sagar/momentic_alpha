@@ -28,8 +28,12 @@ momentic_alpha is a local-first Python trading toolkit built as a small library 
 - `data/processed/`: Feature-enriched tables aligned on timestamps.
 - `data/results/`: Backtest outputs (equity curves, trades, metrics, plots).
 - `state/`: Intentional run metadata and snapshots (no hidden caches).
+- Timestamp standard: all CSVs persist `timestamp` as `"YYYY-MM-DD HH:MM:SS"` (UTC), newest-first on disk. IO helpers (raw/processed/results) must enforce this on write; internal code can use datetime indices but must normalize on write.
 
 ## Entry Points & Extensibility
 - CLI actions invoke library entrypoints to keep notebooks/tests and scripts consistent.
 - Adapters/registries under `src/venues/` let new providers slot in without touching strategies or backtests.
 - Stateless core functions plus explicit state files make local runs reproducible and cloud migration safer.
+- Supported data providers include Massive and Finnhub; providers are constructed from validated settings (env-driven), and all IO must normalize timestamps/ordering when writing.
+- Alpha Vantage is also supported as a `DataProvider` (`alphavantage`), plugging into the same registry. It produces the canonical OHLCV schema so the rest of the pipeline remains provider-agnostic. Typical flow: `actions/fetch_price_history_alphavantage.py` → provider → IO helpers → `data/raw/{TICKER}.csv`.
+- YFinance is another `DataProvider` (`yfinance`) using Yahoo Finance via the `yfinance` library. It plugs into the same registry, produces the canonical OHLCV schema, and is driven through the corresponding fetch action into `data/raw/{TICKER}.csv`.

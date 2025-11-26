@@ -1,0 +1,14 @@
+# Environment / secrets
+.env
+
+# Virtual environments
+.venv/
+
+# Python cache/artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# Local data/results (keep raw/results local by default; track only curated samples)
+data/raw/*.csv
+data/results/

@@ -116,6 +116,17 @@ def build_qqq_momentum_features(
     # Make a copy to avoid modifying input (defensive)
     df = qqq_prices.copy()
 
+    # CRITICAL FIX: Sort to ascending order (oldest first) for correct rolling calculations
+    # Phase 3 schema specifies descending order (newest first), but rolling window
+    # calculations need ascending order to avoid look-ahead bias.
+    # We'll sort here, compute features, then sort back to descending.
+    original_order = df.index.copy()
+    is_descending = df['timestamp'].iloc[0] > df['timestamp'].iloc[-1]
+
+    if is_descending:
+        # Sort to ascending (oldest first) by timestamp
+        df = df.sort_values('timestamp', ascending=True).reset_index(drop=True)
+
     # Step 1: Add moving averages
     # We'll use string labels matching window sizes for column naming
     ma_windows = {
@@ -156,6 +167,10 @@ def build_qqq_momentum_features(
             f"acceleration_{params.acceleration_window}d",
         ]
         df = normalize_features(df, feature_cols, method="zscore")
+
+    # CRITICAL FIX: Sort back to descending order (newest first) to match Phase 3 schema
+    if is_descending:
+        df = df.sort_values('timestamp', ascending=False).reset_index(drop=True)
 
     return df
 

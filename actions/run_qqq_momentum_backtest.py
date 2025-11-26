@@ -268,7 +268,10 @@ def main():
     equity_curve_path = results_dir / "qqq_momentum_equity_curve.csv"
     equity_df = result.equity_curve.reset_index()
     equity_df.columns = ['timestamp', 'equity']
-    equity_df.to_csv(equity_curve_path, index=False)
+
+    # Use write_normalized_csv to ensure canonical timestamp format
+    from src.data.io import write_normalized_csv
+    write_normalized_csv(equity_df, equity_curve_path)
     print(f"  ✓ Saved equity curve: {equity_curve_path}")
 
     # Save metrics as JSON
@@ -280,34 +283,58 @@ def main():
     print(f"  ✓ Saved metrics: {metrics_path}")
 
     # Build reasoning trace (per-date regime and target weights)
+    # IMPORTANT: This captures what the STRATEGY DECIDED, not what was executed
+    # This is crucial for debugging: "What did the strategy think vs what happened?"
     print("  Building reasoning trace...")
     reasoning_trace = []
 
     for state in result.portfolio_history:
         dt = state.timestamp
 
-        # Get regime for this date
+        # Get regime for this date (using normalized timestamp matching)
         regime = strategy.get_regime_for_date(dt)
         regime_label = regime.value if regime else "unknown"
 
-        # Get target weights (reconstruct from positions)
-        # Note: We could also call strategy.generate_target_weights(dt, data, state)
-        # but state.positions already reflects what was executed
-        weights = {sym: pos / state.equity if state.equity > 0 else 0
-                  for sym, pos in state.positions.items()}
+        # Get the ACTUAL target weights the strategy generated for this date
+        # This is what the strategy WANTED, before broker execution
+        # We pass minimal data_slice (just current date) since strategy uses precomputed features
+        data_slice = {}
+        for symbol, df in data.items():
+            # Filter to dates <= dt (matching engine behavior)
+            # Handle both timezone-aware and timezone-naive timestamps
+            df_timestamps = pd.to_datetime(df['timestamp'])
+            if df_timestamps.dt.tz is not None:
+                # Timezone-aware: convert to UTC, remove timezone, normalize
+                normalized_timestamps = df_timestamps.dt.tz_convert('UTC').dt.tz_localize(None).dt.normalize()
+            else:
+                # Timezone-naive: just normalize
+                normalized_timestamps = df_timestamps.dt.normalize()
+            df_slice = df[normalized_timestamps <= dt].copy()
+            data_slice[symbol] = df_slice
+
+        target_weights = strategy.generate_target_weights(dt=dt, data=data_slice, portfolio_state=state)
+
+        # Calculate actual executed weights from final positions (for comparison)
+        executed_weights = {sym: pos / state.equity if state.equity > 0 else 0
+                           for sym, pos in state.positions.items()}
 
         reasoning_trace.append({
             'timestamp': dt,
             'regime': regime_label,
-            'tqqq_weight': weights.get('TQQQ', 0.0),
-            'sqqq_weight': weights.get('SQQQ', 0.0),
-            'cash_weight': 1.0 - sum(weights.values()),
+            'target_tqqq_weight': target_weights.get('TQQQ', 0.0),
+            'target_sqqq_weight': target_weights.get('SQQQ', 0.0),
+            'target_cash_weight': 1.0 - sum(target_weights.values()),
+            'executed_tqqq_weight': executed_weights.get('TQQQ', 0.0),
+            'executed_sqqq_weight': executed_weights.get('SQQQ', 0.0),
+            'executed_cash_weight': 1.0 - sum(executed_weights.values()),
             'equity': state.equity,
         })
 
     reasoning_df = pd.DataFrame(reasoning_trace)
     reasoning_path = results_dir / "qqq_momentum_reasoning_trace.csv"
-    reasoning_df.to_csv(reasoning_path, index=False)
+
+    # Use write_normalized_csv to ensure canonical timestamp format
+    write_normalized_csv(reasoning_df, reasoning_path)
     print(f"  ✓ Saved reasoning trace: {reasoning_path}")
 
     # Optional: Plot equity curve

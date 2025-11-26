@@ -1,0 +1,16 @@
+# Core data science libraries
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Data providers
+yfinance>=0.2.0  # Yahoo Finance data (no API key required)
+requests>=2.28.0  # HTTP client for API-based providers (Finnhub, Alpha Vantage, Massive)
+
+# Environment configuration
+python-dotenv>=0.20.0  # Load .env files for configuration
+
+# Optional: visualization (for analysis scripts)
+matplotlib>=3.7.0
+
+# Testing
+pytest>=7.0.0
